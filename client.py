@@ -10,6 +10,11 @@ MSG_FILE_INFO = 0x01
 MSG_FILE_BLOCK = 0x02
 MSG_ACK = 0x03
 MSG_VERIFY_RESULT = 0x04
+MSG_LIST_BACKUPS = 0x05
+MSG_BACKUP_LIST = 0x06
+MSG_DOWNLOAD_REQUEST = 0x07
+MSG_DOWNLOAD_INFO = 0x08
+MSG_DOWNLOAD_BLOCK = 0x09
 MAX_RETRIES = 3
 TIMEOUT = 10
 
@@ -184,6 +189,132 @@ def send_file(sock, file_path):
     return False
 
 
+def list_backups(sock):
+    header = make_header(MSG_LIST_BACKUPS, b'')
+    if not send_with_retry(sock, header):
+        print("发送备份列表请求失败")
+        return False
+
+    result_header = receive_with_timeout(sock, 9, TIMEOUT)
+    if not result_header or len(result_header) < 9:
+        print("未收到备份列表响应")
+        return False
+
+    magic, msg_type, length, checksum = struct.unpack('>HBIH', result_header[:9])
+    if magic != MAGIC or msg_type != MSG_BACKUP_LIST:
+        print("收到无效的备份列表响应")
+        return False
+
+    list_data = receive_with_timeout(sock, length, TIMEOUT)
+    if not list_data or len(list_data) < length:
+        print("备份列表数据不完整")
+        return False
+
+    if len(list_data) == 0:
+        print("服务器上没有备份文件")
+        return True
+
+    print("\n服务器备份文件列表:")
+    print("-" * 50)
+    pos = 0
+    while pos < len(list_data):
+        null_pos = list_data.find(b'\x00', pos)
+        if null_pos == -1:
+            break
+        filename = list_data[pos:null_pos].decode('utf-8')
+        pos = null_pos + 1
+        if pos + 8 > len(list_data):
+            break
+        file_size = struct.unpack('>Q', list_data[pos:pos+8])[0]
+        pos += 8
+        print(f"{filename} ({file_size} 字节)")
+    print("-" * 50)
+    return True
+
+
+def download_file(sock, filename):
+    request_data = filename.encode('utf-8')
+    header = make_header(MSG_DOWNLOAD_REQUEST, request_data)
+    if not send_with_retry(sock, header + request_data):
+        print("发送下载请求失败")
+        return False
+
+    info_header = receive_with_timeout(sock, 9, TIMEOUT)
+    if not info_header or len(info_header) < 9:
+        print("未收到下载信息响应")
+        return False
+
+    magic, msg_type, length, checksum = struct.unpack('>HBIH', info_header[:9])
+    if magic != MAGIC or msg_type != MSG_DOWNLOAD_INFO:
+        print("收到无效的下载信息响应")
+        return False
+
+    info_data = receive_with_timeout(sock, length, TIMEOUT)
+    if not info_data or len(info_data) < length:
+        print("下载信息数据不完整")
+        return False
+
+    if len(info_data) < 9:
+        print("下载信息格式错误")
+        return False
+
+    success = info_data[0]
+    if success == 0:
+        print("文件不存在")
+        return False
+
+    file_size = struct.unpack('>Q', info_data[1:9])[0]
+    print(f"开始下载文件: {filename} ({file_size} 字节)")
+
+    download_path = os.path.join("downloaded_backups", filename)
+    os.makedirs("downloaded_backups", exist_ok=True)
+
+    try:
+        with open(download_path, 'wb') as f:
+            received_size = 0
+            block_num = 0
+            total_blocks = (file_size + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+            while received_size < file_size:
+                block_header = receive_with_timeout(sock, 9, TIMEOUT)
+                if not block_header or len(block_header) < 9:
+                    print("接收下载块头失败")
+                    return False
+
+                magic, msg_type, length, checksum = struct.unpack('>HBIH', block_header[:9])
+                if magic != MAGIC or msg_type != MSG_DOWNLOAD_BLOCK:
+                    print("收到无效的下载块")
+                    return False
+
+                block_data = receive_with_timeout(sock, length, TIMEOUT)
+                if not block_data or len(block_data) < length:
+                    print("下载块数据不完整")
+                    return False
+
+                if len(block_data) < 4:
+                    print("下载块格式错误")
+                    return False
+
+                recv_block_num = struct.unpack('>I', block_data[:4])[0]
+                data = block_data[4:]
+                received_size += len(data)
+                block_num += 1
+
+                if recv_block_num != block_num:
+                    print(f"块序号错误: 期望 {block_num}, 收到 {recv_block_num}")
+                    return False
+
+                f.write(data)
+                print(f"下载块 {block_num}/{total_blocks} 成功")
+
+        print(f"下载完成: {download_path}")
+        return True
+
+    except IOError as e:
+        print(f"写入文件失败: {e}")
+        return False
+
+
 def ask_continue():
     while True:
         choice = input("\n是否继续备份文件？(y/n): ").strip().lower()
@@ -197,13 +328,11 @@ def main():
     print("TCP 网络文件备份系统 - 客户端")
     print("=" * 40)
 
+    # 先输入服务器信息并建立连接
     while True:
         ip = input("\n请输入服务器IP: ").strip()
         if not ip:
             print("IP不能为空")
-            if not ask_continue():
-                print("\n感谢使用，再见！")
-                break
             continue
 
         port_str = input("请输入服务器端口: ").strip()
@@ -213,67 +342,84 @@ def main():
                 raise ValueError
         except ValueError:
             print("端口无效，请输入1-65535之间的数字")
-            if not ask_continue():
-                print("\n感谢使用，再见！")
-                break
-            continue
-
-        file_path = input("请输入要备份的文件路径: ").strip()
-        if not file_path:
-            print("文件路径不能为空")
-            if not ask_continue():
-                print("\n感谢使用，再见！")
-                break
-            continue
-
-        if not os.path.exists(file_path):
-            print("文件不存在")
-            if not ask_continue():
-                print("\n感谢使用，再见！")
-                break
-            continue
-
-        if not os.path.isfile(file_path):
-            print("路径不是文件")
-            if not ask_continue():
-                print("\n感谢使用，再见！")
-                break
-            continue
-
-        try:
-            with open(file_path, 'rb'):
-                pass
-        except PermissionError:
-            print("没有读取文件的权限")
-            if not ask_continue():
-                print("\n感谢使用，再见！")
-                break
             continue
 
         print("-" * 40)
         sock, err = connect_to_server(ip, port)
         if err:
             print(f"连接失败: {err}")
-            if not ask_continue():
+            choice = input("是否重试连接？(y/n): ").strip().lower()
+            if choice != 'y':
                 print("\n感谢使用，再见！")
-                break
+                return
             continue
 
         print("连接成功！")
+        break
 
-        success = send_file(sock, file_path)
+    # 进入操作菜单
+    while True:
+        print("\n请选择操作:")
+        print("1. 上传文件")
+        print("2. 查看服务器备份列表")
+        print("3. 下载备份文件")
+        print("4. 退出")
+
+        choice = input("请输入选择 (1-4): ").strip()
+        if choice == '4':
+            print("\n感谢使用，再见！")
+            break
+
+        if choice not in ['1', '2', '3']:
+            print("无效选择，请重新输入")
+            continue
+
+        success = False
+        if choice == '1':
+            file_path = input("请输入要备份的文件路径: ").strip()
+            if not file_path:
+                print("文件路径不能为空")
+                continue
+
+            if not os.path.exists(file_path):
+                print("文件不存在")
+                continue
+
+            if not os.path.isfile(file_path):
+                print("路径不是文件")
+                continue
+
+            try:
+                with open(file_path, 'rb'):
+                    pass
+            except PermissionError:
+                print("没有读取文件的权限")
+                continue
+
+            success = send_file(sock, file_path)
+
+        elif choice == '2':
+            success = list_backups(sock)
+
+        elif choice == '3':
+            filename = input("请输入要下载的文件名: ").strip()
+            if not filename:
+                print("文件名不能为空")
+                continue
+            success = download_file(sock, filename)
 
         print("-" * 40)
         if success:
-            print("备份任务完成")
+            print("操作完成")
         else:
-            print("备份任务失败")
+            print("操作失败")
 
-        sock.close()
-
-        if not ask_continue():
+        cont = input("\n是否继续操作？(y/n): ").strip().lower()
+        if cont != 'y':
             print("\n感谢使用，再见！")
             break
+
+    sock.close()
 
 
 if __name__ == "__main__":
